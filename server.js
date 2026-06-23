@@ -1,26 +1,54 @@
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 const next = require("next");
+const Database = require("better-sqlite3");
+const path = require("path");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOSTNAME || "localhost";
 const port = parseInt(process.env.PORT || "3000", 10);
 
-const app = next({ dev, hostname, port });
-const handler = app.getRequestHandler();
+// ---------- SQLite setup ----------
+const db = new Database(path.join(__dirname, "canvas.db"));
+db.pragma("journal_mode = WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS strokes (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    room  TEXT    NOT NULL,
+    data  TEXT    NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_strokes_room ON strokes(room);
+`);
 
-// Per-room state: { strokes: DrawStroke[], users: Map<socketId, UserInfo> }
+const insertStroke = db.prepare("INSERT INTO strokes (room, data) VALUES (?, ?)");
+const selectStrokes = db.prepare("SELECT data FROM strokes WHERE room = ? ORDER BY id ASC");
+const deleteStrokes = db.prepare("DELETE FROM strokes WHERE room = ?");
+
+// Cap per-room strokes: keep newest 5000 after insertion
+const capStrokes = db.prepare(`
+  DELETE FROM strokes
+  WHERE room = ?
+    AND id NOT IN (
+      SELECT id FROM strokes WHERE room = ? ORDER BY id DESC LIMIT 5000
+    )
+`);
+
+// ---------- In-memory live session state ----------
+// Per-room: { users: Map<socketId, UserInfo> }
 const rooms = new Map();
 
 function getOrCreateRoom(roomId) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, { strokes: [], users: new Map() });
+    rooms.set(roomId, { users: new Map() });
   }
   return rooms.get(roomId);
 }
 
-// Assign a distinct hue per user slot in the room (for cursor color)
 const USER_HUES = [210, 0, 120, 270, 30, 180, 300, 60];
+
+// ---------- Next.js ----------
+const app = next({ dev, hostname, port });
+const handler = app.getRequestHandler();
 
 app.prepare().then(() => {
   const httpServer = createServer(handler);
@@ -48,37 +76,36 @@ app.prepare().then(() => {
       room.users.set(socket.id, userInfo);
       socket.join(roomId);
 
-      // Send existing canvas state to the new joiner
-      socket.emit("canvas-state", { strokes: room.strokes });
+      // Load persisted strokes from DB and send to new joiner
+      const rows = selectStrokes.all(roomId);
+      const strokes = rows.map((r) => JSON.parse(r.data));
+      socket.emit("canvas-state", { strokes });
 
-      // Send current user list
       socket.emit("self-info", userInfo);
       io.to(roomId).emit("users-update", usersArray(room));
-
       socket.to(roomId).emit("user-joined", { user: userInfo });
     });
 
     socket.on("draw-stroke", (stroke) => {
       if (!currentRoom) return;
-      const room = rooms.get(currentRoom);
-      if (!room) return;
-      room.strokes.push(stroke);
-      // Cap stored strokes to prevent unbounded memory growth
-      if (room.strokes.length > 5000) room.strokes.splice(0, 1000);
+      // Persist to DB
+      insertStroke.run(currentRoom, JSON.stringify(stroke));
+      capStrokes.run(currentRoom, currentRoom);
+      // Broadcast to other clients in room
       socket.to(currentRoom).emit("draw-stroke", stroke);
     });
 
     socket.on("cursor-move", ({ x, y }) => {
       if (!currentRoom || !userInfo) return;
       userInfo.cursor = { x, y };
-      socket.to(currentRoom).emit("cursor-update", { id: socket.id, x, y, hue: userInfo.hue, name: userInfo.name });
+      socket.to(currentRoom).emit("cursor-update", {
+        id: socket.id, x, y, hue: userInfo.hue, name: userInfo.name,
+      });
     });
 
     socket.on("clear-canvas", () => {
       if (!currentRoom) return;
-      const room = rooms.get(currentRoom);
-      if (!room) return;
-      room.strokes = [];
+      deleteStrokes.run(currentRoom);
       io.to(currentRoom).emit("clear-canvas");
     });
 
