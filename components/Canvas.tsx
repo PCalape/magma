@@ -1,45 +1,48 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
-import { DrawStroke, Tool, CursorUpdate } from "@/lib/types";
-import { Socket } from "socket.io-client";
+import {
+  useEffect, useRef, useCallback,
+  forwardRef, useImperativeHandle,
+} from "react";
+import { DrawStroke, Tool } from "@/lib/types";
+
+export interface CanvasHandle {
+  drawStroke: (stroke: DrawStroke) => void;
+  loadStrokes: (strokes: DrawStroke[]) => void;
+}
 
 interface Props {
-  socket: Socket;
   tool: Tool;
   color: string;
   size: number;
-  onCursorsChange: (updater: (prev: Map<string, CursorUpdate>) => Map<string, CursorUpdate>) => void;
+  onStroke: (stroke: DrawStroke) => void;
   clearSignal: number;
 }
 
-export default function Canvas({ socket, tool, color, size, onCursorsChange, clearSignal }: Props) {
+const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
+  { tool, color, size, onStroke, clearSignal },
+  ref
+) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isDrawing = useRef(false);
   const currentStroke = useRef<{ x: number; y: number }[]>([]);
   const lastPoint = useRef<{ x: number; y: number } | null>(null);
-
-  // Client-side stroke log — source of truth for redraws on resize/clear
   const allStrokes = useRef<DrawStroke[]>([]);
 
-  // ---------- canvas helpers ----------
+  // ---------- helpers ----------
 
   function getCtx() {
-    const canvas = canvasRef.current;
-    return canvas ? canvas.getContext("2d") : null;
+    return canvasRef.current?.getContext("2d") ?? null;
   }
 
-  function canvasPoint(e: MouseEvent | TouchEvent): { x: number; y: number } {
+  function canvasPoint(e: MouseEvent | TouchEvent) {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
     const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
     const clientY = "touches" in e ? e.touches[0].clientY : e.clientY;
-    return {
-      x: (clientX - rect.left) * scaleX,
-      y: (clientY - rect.top) * scaleY,
-    };
+    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
   }
 
   function drawSegment(
@@ -62,7 +65,7 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
   }
 
   const replayStroke = useCallback((ctx: CanvasRenderingContext2D, stroke: DrawStroke) => {
-    if (stroke.points.length === 0) return;
+    if (!stroke.points.length) return;
     ctx.beginPath();
     ctx.globalCompositeOperation = stroke.tool === "eraser" ? "destination-out" : "source-over";
     ctx.strokeStyle = stroke.tool === "eraser" ? "rgba(0,0,0,1)" : stroke.color;
@@ -85,13 +88,26 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
     allStrokes.current.forEach((s) => replayStroke(ctx, s));
   }, [replayStroke]);
 
-  // ---------- resize: replay strokes instead of snapshot/restore ----------
+  // ---------- imperative API for parent ----------
+
+  useImperativeHandle(ref, () => ({
+    drawStroke(stroke: DrawStroke) {
+      allStrokes.current.push(stroke);
+      const ctx = getCtx();
+      if (ctx) replayStroke(ctx, stroke);
+    },
+    loadStrokes(strokes: DrawStroke[]) {
+      allStrokes.current = strokes;
+      redrawAll();
+    },
+  }), [replayStroke, redrawAll]);
+
+  // ---------- resize ----------
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const parent = canvas.parentElement!;
-
     const observer = new ResizeObserver(() => {
       canvas.width = parent.clientWidth;
       canvas.height = parent.clientHeight;
@@ -101,59 +117,15 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
     return () => observer.disconnect();
   }, [redrawAll]);
 
-  // ---------- clear signal (local user pressed Clear) ----------
+  // ---------- clear signal ----------
 
   useEffect(() => {
     allStrokes.current = [];
-    const ctx = getCtx();
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, [clearSignal]);
-
-  // ---------- socket events ----------
-
-  useEffect(() => {
-    socket.on("canvas-state", ({ strokes }: { strokes: DrawStroke[] }) => {
-      allStrokes.current = strokes;
-      redrawAll();
-    });
-
-    socket.on("draw-stroke", (stroke: DrawStroke) => {
-      allStrokes.current.push(stroke);
-      const ctx = getCtx();
-      if (ctx) replayStroke(ctx, stroke);
-    });
-
-    socket.on("clear-canvas", () => {
-      allStrokes.current = [];
-      const ctx = getCtx();
-      if (ctx) ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
-    });
-
-    socket.on("cursor-update", (update: CursorUpdate) => {
-      onCursorsChange((prev) => {
-        const next = new Map(prev);
-        next.set(update.id, update);
-        return next;
-      });
-    });
-
-    socket.on("user-left", ({ id }: { id: string }) => {
-      onCursorsChange((prev) => {
-        const next = new Map(prev);
-        next.delete(id);
-        return next;
-      });
-    });
-
-    return () => {
-      socket.off("canvas-state");
-      socket.off("draw-stroke");
-      socket.off("clear-canvas");
-      socket.off("cursor-update");
-      socket.off("user-left");
-    };
-  }, [socket, replayStroke, redrawAll, onCursorsChange]);
 
   // ---------- drawing ----------
 
@@ -170,41 +142,30 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
 
   const draw = useCallback((e: MouseEvent | TouchEvent) => {
     if ("touches" in e) e.preventDefault();
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    const clientX = "touches" in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
-    const clientY = "touches" in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
-
-    socket.emit("cursor-move", { x: clientX - rect.left, y: clientY - rect.top });
-
     if (!isDrawing.current || !lastPoint.current) return;
-
     const pt = canvasPoint(e);
     const ctx = getCtx();
     if (ctx) drawSegment(ctx, lastPoint.current, pt, color, size, tool);
     lastPoint.current = pt;
     currentStroke.current.push(pt);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [color, size, tool, socket]);
+  }, [color, size, tool]);
 
   const stopDrawing = useCallback(() => {
     if (!isDrawing.current) return;
     isDrawing.current = false;
-
     if (currentStroke.current.length > 0) {
       const stroke: DrawStroke = { points: currentStroke.current, color, size, tool };
       allStrokes.current.push(stroke);
-      socket.emit("draw-stroke", stroke);
+      onStroke(stroke);
       currentStroke.current = [];
     }
     lastPoint.current = null;
-  }, [color, size, tool, socket]);
+  }, [color, size, tool, onStroke]);
 
-  // Attach pointer events to canvas element
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     canvas.addEventListener("mousedown", startDrawing);
     canvas.addEventListener("mousemove", draw);
     canvas.addEventListener("mouseup", stopDrawing);
@@ -212,7 +173,6 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
     canvas.addEventListener("touchstart", startDrawing, { passive: false });
     canvas.addEventListener("touchmove", draw, { passive: false });
     canvas.addEventListener("touchend", stopDrawing);
-
     return () => {
       canvas.removeEventListener("mousedown", startDrawing);
       canvas.removeEventListener("mousemove", draw);
@@ -231,4 +191,6 @@ export default function Canvas({ socket, tool, color, size, onCursorsChange, cle
       style={{ cursor: "none", touchAction: "none" }}
     />
   );
-}
+});
+
+export default Canvas;
