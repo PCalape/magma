@@ -1,67 +1,50 @@
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 const next = require("next");
-const Database = require("better-sqlite3");
-const path = require("path");
+const { MongoClient } = require("mongodb");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOSTNAME || "localhost";
 const port = parseInt(process.env.PORT || "3000", 10);
-
-// ---------- SQLite setup ----------
-const db = new Database(path.join(__dirname, "canvas.db"));
-db.pragma("journal_mode = WAL");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS strokes (
-    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    room  TEXT    NOT NULL,
-    data  TEXT    NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_strokes_room ON strokes(room);
-`);
-
-const insertStroke = db.prepare("INSERT INTO strokes (room, data) VALUES (?, ?)");
-const selectStrokes = db.prepare("SELECT data FROM strokes WHERE room = ? ORDER BY id ASC");
-const deleteStrokes = db.prepare("DELETE FROM strokes WHERE room = ?");
-
-// Cap per-room strokes: keep newest 5000 after insertion
-const capStrokes = db.prepare(`
-  DELETE FROM strokes
-  WHERE room = ?
-    AND id NOT IN (
-      SELECT id FROM strokes WHERE room = ? ORDER BY id DESC LIMIT 5000
-    )
-`);
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
+const DB_NAME = "magma";
 
 // ---------- In-memory live session state ----------
-// Per-room: { users: Map<socketId, UserInfo> }
 const rooms = new Map();
+const USER_HUES = [210, 0, 120, 270, 30, 180, 300, 60];
 
 function getOrCreateRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, { users: new Map() });
-  }
+  if (!rooms.has(roomId)) rooms.set(roomId, { users: new Map() });
   return rooms.get(roomId);
 }
 
-const USER_HUES = [210, 0, 120, 270, 30, 180, 300, 60];
+function usersArray(room) {
+  return Array.from(room.users.values());
+}
 
-// ---------- Next.js ----------
-const app = next({ dev, hostname, port });
-const handler = app.getRequestHandler();
+// ---------- Bootstrap ----------
+async function main() {
+  const mongo = new MongoClient(MONGO_URI);
+  await mongo.connect();
+  console.log("> MongoDB connected");
 
-app.prepare().then(() => {
+  const db = mongo.db(DB_NAME);
+  const strokes = db.collection("strokes");
+  // Index for fast per-room queries
+  await strokes.createIndex({ room: 1, _id: 1 });
+
+  const app = next({ dev, hostname, port });
+  const handler = app.getRequestHandler();
+  await app.prepare();
+
   const httpServer = createServer(handler);
-
-  const io = new Server(httpServer, {
-    cors: { origin: "*" },
-  });
+  const io = new Server(httpServer, { cors: { origin: "*" } });
 
   io.on("connection", (socket) => {
     let currentRoom = null;
     let userInfo = null;
 
-    socket.on("join-room", ({ roomId, name }) => {
+    socket.on("join-room", async ({ roomId, name }) => {
       currentRoom = roomId;
       const room = getOrCreateRoom(roomId);
 
@@ -76,22 +59,32 @@ app.prepare().then(() => {
       room.users.set(socket.id, userInfo);
       socket.join(roomId);
 
-      // Load persisted strokes from DB and send to new joiner
-      const rows = selectStrokes.all(roomId);
-      const strokes = rows.map((r) => JSON.parse(r.data));
-      socket.emit("canvas-state", { strokes });
+      // Load persisted strokes and send to the new joiner
+      const docs = await strokes
+        .find({ room: roomId }, { projection: { _id: 0, room: 0 } })
+        .sort({ _id: 1 })
+        .toArray();
+      socket.emit("canvas-state", { strokes: docs });
 
       socket.emit("self-info", userInfo);
       io.to(roomId).emit("users-update", usersArray(room));
       socket.to(roomId).emit("user-joined", { user: userInfo });
     });
 
-    socket.on("draw-stroke", (stroke) => {
+    socket.on("draw-stroke", async (stroke) => {
       if (!currentRoom) return;
-      // Persist to DB
-      insertStroke.run(currentRoom, JSON.stringify(stroke));
-      capStrokes.run(currentRoom, currentRoom);
-      // Broadcast to other clients in room
+      await strokes.insertOne({ room: currentRoom, ...stroke });
+      // Cap to newest 5000 strokes per room
+      const count = await strokes.countDocuments({ room: currentRoom });
+      if (count > 5000) {
+        const oldest = await strokes
+          .find({ room: currentRoom })
+          .sort({ _id: 1 })
+          .limit(count - 5000)
+          .toArray();
+        const ids = oldest.map((d) => d._id);
+        await strokes.deleteMany({ _id: { $in: ids } });
+      }
       socket.to(currentRoom).emit("draw-stroke", stroke);
     });
 
@@ -103,9 +96,9 @@ app.prepare().then(() => {
       });
     });
 
-    socket.on("clear-canvas", () => {
+    socket.on("clear-canvas", async () => {
       if (!currentRoom) return;
-      deleteStrokes.run(currentRoom);
+      await strokes.deleteMany({ room: currentRoom });
       io.to(currentRoom).emit("clear-canvas");
     });
 
@@ -123,8 +116,9 @@ app.prepare().then(() => {
   httpServer.listen(port, () => {
     console.log(`> Ready on http://${hostname}:${port}`);
   });
-});
-
-function usersArray(room) {
-  return Array.from(room.users.values());
 }
+
+main().catch((err) => {
+  console.error("Failed to start:", err.message);
+  process.exit(1);
+});
