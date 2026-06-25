@@ -6,7 +6,12 @@ export async function POST(req: NextRequest) {
   const { roomId, stroke } = await req.json();
 
   const db = await getDb();
-  await db.collection("strokes").insertOne({ room: roomId, ...stroke });
+  // Single document per room — atomic push + cap in one operation
+  await db.collection("rooms").updateOne(
+    { room: roomId },
+    { $push: { strokes: { $each: [stroke], $slice: -5000 } } } as object,
+    { upsert: true }
+  );
 
   await getPusher().trigger(`presence-room-${roomId}`, "draw-stroke", stroke);
 

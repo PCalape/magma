@@ -45,30 +45,34 @@ export default function Toolbar({
         </ToolButton>
       </div>
 
-      <Divider />
+      {tool === "pen" && (
+        <>
+          <Divider />
 
-      {/* Color picker */}
-      <div className="flex flex-col gap-2 items-center w-full">
-        <label className="text-zinc-400 text-[10px] uppercase tracking-widest">Color</label>
-        <input
-          type="color"
-          value={color}
-          onChange={(e) => onColorChange(e.target.value)}
-          className="w-10 h-10 rounded cursor-pointer border-2 border-zinc-600 bg-transparent p-0.5"
-          title="Pick color"
-        />
-        <div className="flex flex-wrap gap-1 justify-center">
-          {PRESET_COLORS.map((c) => (
-            <button
-              key={c}
-              onClick={() => onColorChange(c)}
-              title={c}
-              style={{ backgroundColor: c }}
-              className={`w-4 h-4 rounded-sm border ${color === c ? "border-white scale-125" : "border-zinc-600"} transition-transform`}
+          {/* Color picker */}
+          <div className="flex flex-col gap-2 items-center w-full">
+            <label className="text-zinc-400 text-[10px] uppercase tracking-widest">Color</label>
+            <input
+              type="color"
+              value={color}
+              onChange={(e) => onColorChange(e.target.value)}
+              className="w-10 h-10 rounded cursor-pointer border-2 border-zinc-600 bg-transparent p-0.5"
+              title="Pick color"
             />
-          ))}
-        </div>
-      </div>
+            <div className="flex flex-wrap gap-1 justify-center">
+              {PRESET_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => onColorChange(c)}
+                  title={c}
+                  style={{ backgroundColor: c }}
+                  className={`w-4 h-4 rounded-sm border ${color === c ? "border-white scale-125" : "border-zinc-600"} transition-transform`}
+                />
+              ))}
+            </div>
+          </div>
+        </>
+      )}
 
       <Divider />
 

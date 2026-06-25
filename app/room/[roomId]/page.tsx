@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import PusherClient, { Channel } from "pusher-js";
-import { DrawStroke, Tool, CursorUpdate } from "@/lib/types";
+import { DrawStroke, DrawSegment, Tool, CursorUpdate } from "@/lib/types";
 import Canvas, { CanvasHandle } from "@/components/Canvas";
 import Toolbar from "@/components/Toolbar";
 import UserCursors from "@/components/UserCursors";
@@ -33,6 +33,7 @@ export default function RoomPage() {
 
   const canvasRef = useRef<CanvasHandle>(null);
   const channelRef = useRef<Channel | null>(null);
+  const lastSegmentAt = useRef(0);
 
   // Load persisted strokes on mount
   useEffect(() => {
@@ -85,12 +86,23 @@ export default function RoomPage() {
       setCursors((prev) => { const m = new Map(prev); m.set(update.id, update); return m; });
     });
 
+    channel.bind("client-draw-segment", (seg: DrawSegment) => {
+      canvasRef.current?.drawSegment(seg);
+    });
+
     return () => {
       channel.unbind_all();
       pusher.unsubscribe(`presence-room-${roomId}`);
       pusher.disconnect();
     };
   }, [roomId, userName]);
+
+  const handleSegment = useCallback((seg: DrawSegment) => {
+    const now = Date.now();
+    if (now - lastSegmentAt.current < 50) return; // throttle to ~20/sec (Pusher limit: 10/sec)
+    lastSegmentAt.current = now;
+    channelRef.current?.trigger("client-draw-segment", seg);
+  }, []);
 
   const handleStroke = useCallback((stroke: DrawStroke) => {
     fetch("/api/draw", {
@@ -179,6 +191,7 @@ export default function RoomPage() {
             color={color}
             size={size}
             onStroke={handleStroke}
+            onSegment={handleSegment}
             clearSignal={clearSignal}
           />
           <UserCursors cursors={cursors} />

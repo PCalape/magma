@@ -7,11 +7,10 @@ export async function GET(
 ) {
   const { roomId } = await params;
   const db = await getDb();
-  const strokes = await db
-    .collection("strokes")
-    .find({ room: roomId }, { projection: { _id: 0, room: 0 } })
-    .sort({ _id: 1 })
-    .toArray();
+  const doc = await db.collection("rooms").findOne(
+    { room: roomId },
+    { projection: { _id: 0, strokes: 1 } }
+  );
 
-  return NextResponse.json({ strokes });
+  return NextResponse.json({ strokes: doc?.strokes ?? [] });
 }

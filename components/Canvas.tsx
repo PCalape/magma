@@ -4,10 +4,11 @@ import {
   useEffect, useRef, useCallback,
   forwardRef, useImperativeHandle,
 } from "react";
-import { DrawStroke, Tool } from "@/lib/types";
+import { DrawStroke, DrawSegment, Tool } from "@/lib/types";
 
 export interface CanvasHandle {
   drawStroke: (stroke: DrawStroke) => void;
+  drawSegment: (seg: DrawSegment) => void;
   loadStrokes: (strokes: DrawStroke[]) => void;
 }
 
@@ -16,11 +17,12 @@ interface Props {
   color: string;
   size: number;
   onStroke: (stroke: DrawStroke) => void;
+  onSegment: (seg: DrawSegment) => void;
   clearSignal: number;
 }
 
 const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
-  { tool, color, size, onStroke, clearSignal },
+  { tool, color, size, onStroke, onSegment, clearSignal },
   ref
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -45,7 +47,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
   }
 
-  function drawSegment(
+  function paintSegment(
     ctx: CanvasRenderingContext2D,
     from: { x: number; y: number },
     to: { x: number; y: number },
@@ -96,6 +98,12 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
       const ctx = getCtx();
       if (ctx) replayStroke(ctx, stroke);
     },
+    drawSegment(seg: DrawSegment) {
+      // Live segment from another user — paint immediately, not stored
+      // (the completed stroke will arrive via drawStroke and be persisted)
+      const ctx = getCtx();
+      if (ctx) paintSegment(ctx, seg.from, seg.to, seg.color, seg.size, seg.tool);
+    },
     loadStrokes(strokes: DrawStroke[]) {
       allStrokes.current = strokes;
       redrawAll();
@@ -136,7 +144,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     lastPoint.current = pt;
     currentStroke.current = [pt];
     const ctx = getCtx();
-    if (ctx) drawSegment(ctx, pt, pt, color, size, tool);
+    if (ctx) paintSegment(ctx, pt, pt, color, size, tool);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [color, size, tool]);
 
@@ -145,11 +153,13 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     if (!isDrawing.current || !lastPoint.current) return;
     const pt = canvasPoint(e);
     const ctx = getCtx();
-    if (ctx) drawSegment(ctx, lastPoint.current, pt, color, size, tool);
+    if (ctx) paintSegment(ctx, lastPoint.current, pt, color, size, tool);
+    // Stream this segment to other users in real time
+    onSegment({ from: lastPoint.current, to: pt, color, size, tool });
     lastPoint.current = pt;
     currentStroke.current.push(pt);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [color, size, tool]);
+  }, [color, size, tool, onSegment]);
 
   const stopDrawing = useCallback(() => {
     if (!isDrawing.current) return;

@@ -6,7 +6,10 @@ export async function POST(req: NextRequest) {
   const { roomId } = await req.json();
 
   const db = await getDb();
-  await db.collection("strokes").deleteMany({ room: roomId });
+  await db.collection("rooms").updateOne(
+    { room: roomId },
+    { $set: { strokes: [] } }
+  );
 
   await getPusher().trigger(`presence-room-${roomId}`, "clear-canvas", {});
 

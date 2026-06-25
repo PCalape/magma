@@ -14,6 +14,14 @@ export interface UserInfo {
   cursor: { x: number; y: number };
 }
 
+export interface DrawSegment {
+  from: { x: number; y: number };
+  to: { x: number; y: number };
+  color: string;
+  size: number;
+  tool: Tool;
+}
+
 export interface CursorUpdate {
   id: string;
   x: number;
