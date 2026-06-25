@@ -3,7 +3,7 @@ import { getDb } from "@/lib/mongo";
 import { getPusher } from "@/lib/pusher-server";
 
 export async function POST(req: NextRequest) {
-  const { roomId, stroke } = await req.json();
+  const { roomId, userId, stroke } = await req.json();
 
   const db = await getDb();
   // Single document per room — atomic push + cap in one operation
@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
     { upsert: true }
   );
 
-  await getPusher().trigger(`presence-room-${roomId}`, "draw-stroke", stroke);
+  await getPusher().trigger(`presence-room-${roomId}`, "draw-stroke", { ...stroke, userId });
 
   return NextResponse.json({ ok: true });
 }

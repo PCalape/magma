@@ -4,11 +4,23 @@ import {
   useEffect, useRef, useCallback,
   forwardRef, useImperativeHandle,
 } from "react";
-import { DrawStroke, DrawSegment, Tool } from "@/lib/types";
+import { DrawStroke, Tool } from "@/lib/types";
+
+type Point = { x: number; y: number };
+
+// Used only internally to communicate segments from draw → onSegment
+interface DrawSegment {
+  from: Point;
+  to: Point;
+  color: string;
+  size: number;
+  tool: Tool;
+}
 
 export interface CanvasHandle {
   drawStroke: (stroke: DrawStroke) => void;
-  drawSegment: (seg: DrawSegment) => void;
+  /** Draw a connected chain: from → points[0] → points[1] → … */
+  drawPoints: (from: Point | null, points: Point[], color: string, size: number, tool: Tool) => void;
   loadStrokes: (strokes: DrawStroke[]) => void;
 }
 
@@ -27,17 +39,15 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isDrawing = useRef(false);
-  const currentStroke = useRef<{ x: number; y: number }[]>([]);
-  const lastPoint = useRef<{ x: number; y: number } | null>(null);
+  const currentStroke = useRef<Point[]>([]);
+  const lastPoint = useRef<Point | null>(null);
   const allStrokes = useRef<DrawStroke[]>([]);
-
-  // ---------- helpers ----------
 
   function getCtx() {
     return canvasRef.current?.getContext("2d") ?? null;
   }
 
-  function canvasPoint(e: MouseEvent | TouchEvent) {
+  function canvasPoint(e: MouseEvent | TouchEvent): Point {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
@@ -47,18 +57,11 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
   }
 
-  function paintSegment(
-    ctx: CanvasRenderingContext2D,
-    from: { x: number; y: number },
-    to: { x: number; y: number },
-    strokeColor: string,
-    strokeSize: number,
-    strokeTool: Tool
-  ) {
+  function paintLine(ctx: CanvasRenderingContext2D, from: Point, to: Point, c: string, s: number, t: Tool) {
     ctx.beginPath();
-    ctx.globalCompositeOperation = strokeTool === "eraser" ? "destination-out" : "source-over";
-    ctx.strokeStyle = strokeTool === "eraser" ? "rgba(0,0,0,1)" : strokeColor;
-    ctx.lineWidth = strokeSize;
+    ctx.globalCompositeOperation = t === "eraser" ? "destination-out" : "source-over";
+    ctx.strokeStyle = t === "eraser" ? "rgba(0,0,0,1)" : c;
+    ctx.lineWidth = s;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.moveTo(from.x, from.y);
@@ -75,9 +78,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-    for (let i = 1; i < stroke.points.length; i++) {
-      ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
-    }
+    for (let i = 1; i < stroke.points.length; i++) ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
     ctx.stroke();
   }, []);
 
@@ -90,19 +91,20 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     allStrokes.current.forEach((s) => replayStroke(ctx, s));
   }, [replayStroke]);
 
-  // ---------- imperative API for parent ----------
-
   useImperativeHandle(ref, () => ({
     drawStroke(stroke: DrawStroke) {
       allStrokes.current.push(stroke);
       const ctx = getCtx();
       if (ctx) replayStroke(ctx, stroke);
     },
-    drawSegment(seg: DrawSegment) {
-      // Live segment from another user — paint immediately, not stored
-      // (the completed stroke will arrive via drawStroke and be persisted)
+    drawPoints(from: Point | null, points: Point[], c: string, s: number, t: Tool) {
       const ctx = getCtx();
-      if (ctx) paintSegment(ctx, seg.from, seg.to, seg.color, seg.size, seg.tool);
+      if (!ctx || points.length === 0) return;
+      let prev = from ?? points[0];
+      for (const pt of points) {
+        paintLine(ctx, prev, pt, c, s, t);
+        prev = pt;
+      }
     },
     loadStrokes(strokes: DrawStroke[]) {
       allStrokes.current = strokes;
@@ -110,8 +112,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     },
   }), [replayStroke, redrawAll]);
 
-  // ---------- resize ----------
-
+  // Resize — replay from allStrokes instead of snapshot/restore
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -125,8 +126,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     return () => observer.disconnect();
   }, [redrawAll]);
 
-  // ---------- clear signal ----------
-
+  // Clear signal
   useEffect(() => {
     allStrokes.current = [];
     const canvas = canvasRef.current;
@@ -135,8 +135,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, [clearSignal]);
 
-  // ---------- drawing ----------
-
+  // Drawing
   const startDrawing = useCallback((e: MouseEvent | TouchEvent) => {
     if ("touches" in e) e.preventDefault();
     const pt = canvasPoint(e);
@@ -144,7 +143,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     lastPoint.current = pt;
     currentStroke.current = [pt];
     const ctx = getCtx();
-    if (ctx) paintSegment(ctx, pt, pt, color, size, tool);
+    if (ctx) paintLine(ctx, pt, pt, color, size, tool);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [color, size, tool]);
 
@@ -153,8 +152,7 @@ const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     if (!isDrawing.current || !lastPoint.current) return;
     const pt = canvasPoint(e);
     const ctx = getCtx();
-    if (ctx) paintSegment(ctx, lastPoint.current, pt, color, size, tool);
-    // Stream this segment to other users in real time
+    if (ctx) paintLine(ctx, lastPoint.current, pt, color, size, tool);
     onSegment({ from: lastPoint.current, to: pt, color, size, tool });
     lastPoint.current = pt;
     currentStroke.current.push(pt);

@@ -7,19 +7,19 @@ export interface DrawStroke {
   tool: Tool;
 }
 
+export interface DrawBatch {
+  userId: string;
+  points: { x: number; y: number }[];
+  color: string;
+  size: number;
+  tool: Tool;
+}
+
 export interface UserInfo {
   id: string;
   name: string;
   hue: number;
   cursor: { x: number; y: number };
-}
-
-export interface DrawSegment {
-  from: { x: number; y: number };
-  to: { x: number; y: number };
-  color: string;
-  size: number;
-  tool: Tool;
 }
 
 export interface CursorUpdate {
