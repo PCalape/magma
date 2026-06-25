@@ -3,12 +3,20 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import PusherClient, { Channel } from "pusher-js";
-import { DrawStroke, DrawBatch, Tool, CursorUpdate } from "@/lib/types";
+import { DrawStroke, Tool, CursorUpdate } from "@/lib/types";
 import Canvas, { CanvasHandle } from "@/components/Canvas";
 import Toolbar from "@/components/Toolbar";
 import UserCursors from "@/components/UserCursors";
 
 type Point = { x: number; y: number };
+
+interface ClientUpdate {
+  userId: string;
+  name: string;
+  hue: number;
+  cursor: Point;
+  drawing?: { points: Point[]; color: string; size: number; tool: Tool };
+}
 
 function hueFromId(id: string): number {
   const hues = [210, 0, 120, 270, 30, 180, 300, 60];
@@ -35,19 +43,14 @@ export default function RoomPage() {
 
   const canvasRef = useRef<CanvasHandle>(null);
   const channelRef = useRef<Channel | null>(null);
-  const selfIdRef = useRef("");              // ref copy so interval closure stays current
-  const remoteChain = useRef<Map<string, Point>>(new Map()); // last point per remote user
+  const selfIdRef = useRef("");
+  const selfHueRef = useRef(210);
+  const localCursorRef = useRef<Point>({ x: 0, y: 0 });
+  const remoteChain = useRef<Map<string, Point>>(new Map());
+  const batchRef = useRef<{ pts: Point[]; color: string; size: number; tool: Tool } | null>(null);
 
-  // Outgoing point batch: accumulate every point during a stroke, flush via interval
-  const batchRef = useRef<{
-    pts: Point[];
-    color: string;
-    size: number;
-    tool: Tool;
-  } | null>(null);
-
-  // Keep selfIdRef in sync with selfId state
   useEffect(() => { selfIdRef.current = selfId; }, [selfId]);
+  useEffect(() => { selfHueRef.current = selfHue; }, [selfHue]);
 
   // Load persisted strokes on mount
   useEffect(() => {
@@ -58,7 +61,7 @@ export default function RoomPage() {
       });
   }, [roomId]);
 
-  // Pusher presence channel + 80ms batch flush interval
+  // Pusher + single 100ms flush for cursor AND drawing combined
   useEffect(() => {
     const pusher = new PusherClient(process.env.NEXT_PUBLIC_PUSHER_KEY!, {
       cluster: process.env.NEXT_PUBLIC_PUSHER_CLUSTER!,
@@ -76,9 +79,11 @@ export default function RoomPage() {
 
     channel.bind("pusher:subscription_succeeded", (members: { me: { id: string }; count: number }) => {
       const id = members.me.id;
+      const hue = hueFromId(id);
       setSelfId(id);
+      setSelfHue(hue);
       selfIdRef.current = id;
-      setSelfHue(hueFromId(id));
+      selfHueRef.current = hue;
       setUserCount(members.count);
     });
 
@@ -90,7 +95,6 @@ export default function RoomPage() {
       setCursors((prev) => { const m = new Map(prev); m.delete(member.id); return m; });
     });
 
-    // Completed stroke from another user — add to allStrokes for resize-safety
     channel.bind("draw-stroke", (payload: DrawStroke & { userId?: string }) => {
       if (payload.userId) remoteChain.current.delete(payload.userId);
       canvasRef.current?.drawStroke(payload);
@@ -101,36 +105,48 @@ export default function RoomPage() {
       setClearSignal((s) => s + 1);
     });
 
-    channel.bind("client-cursor-move", (update: CursorUpdate) => {
-      setCursors((prev) => { const m = new Map(prev); m.set(update.id, update); return m; });
+    // One combined event handles both cursor position and live drawing points
+    channel.bind("client-update", (update: ClientUpdate) => {
+      // Update cursor overlay
+      setCursors((prev) => {
+        const m = new Map(prev);
+        m.set(update.userId, { id: update.userId, x: update.cursor.x, y: update.cursor.y, name: update.name, hue: update.hue });
+        return m;
+      });
+
+      // Draw live points if present
+      if (update.drawing && update.drawing.points.length > 0) {
+        const { points, color, size, tool } = update.drawing;
+        const from = remoteChain.current.get(update.userId) ?? null;
+        canvasRef.current?.drawPoints(from, points, color, size, tool);
+        remoteChain.current.set(update.userId, points[points.length - 1]);
+      }
     });
 
-    // Batched points from another user — chain from their last known point
-    channel.bind("client-drawing", (batch: DrawBatch) => {
-      if (!batch.points.length) return;
-      const from = remoteChain.current.get(batch.userId) ?? null;
-      canvasRef.current?.drawPoints(from, batch.points, batch.color, batch.size, batch.tool);
-      remoteChain.current.set(batch.userId, batch.points[batch.points.length - 1]);
-    });
-
-    // Flush accumulated points every 80ms (~12/sec, within Pusher's 10/sec limit with some headroom)
+    // Single 100ms interval: sends cursor + any accumulated drawing points in one event
+    // Stays at exactly 10 events/sec — Pusher's client event limit
     const flushTimer = setInterval(() => {
-      const buf = batchRef.current;
       const uid = selfIdRef.current;
-      if (!buf || buf.pts.length < 2 || !uid) return;
+      const ch = channelRef.current;
+      if (!uid || !ch) return;
 
-      const toSend = buf.pts;
-      // Keep the last point as the start of the next batch to avoid gaps
-      batchRef.current = { pts: [toSend[toSend.length - 1]], color: buf.color, size: buf.size, tool: buf.tool };
-
-      channel.trigger("client-drawing", {
+      const buf = batchRef.current;
+      const payload: ClientUpdate = {
         userId: uid,
-        points: toSend,
-        color: buf.color,
-        size: buf.size,
-        tool: buf.tool,
-      } satisfies DrawBatch);
-    }, 80);
+        name: userName,
+        hue: selfHueRef.current,
+        cursor: { ...localCursorRef.current },
+      };
+
+      if (buf && buf.pts.length >= 2) {
+        const toSend = buf.pts;
+        // Carry last point forward so next batch chains without a gap
+        batchRef.current = { pts: [toSend[toSend.length - 1]], color: buf.color, size: buf.size, tool: buf.tool };
+        payload.drawing = { points: toSend, color: buf.color, size: buf.size, tool: buf.tool };
+      }
+
+      ch.trigger("client-update", payload);
+    }, 100);
 
     return () => {
       clearInterval(flushTimer);
@@ -140,7 +156,6 @@ export default function RoomPage() {
     };
   }, [roomId, userName]);
 
-  // Accumulate points from local drawing into the batch buffer
   const handleSegment = useCallback((seg: { from: Point; to: Point; color: string; size: number; tool: Tool }) => {
     if (!batchRef.current) {
       batchRef.current = { pts: [seg.from], color: seg.color, size: seg.size, tool: seg.tool };
@@ -149,7 +164,7 @@ export default function RoomPage() {
   }, []);
 
   const handleStroke = useCallback((stroke: DrawStroke) => {
-    batchRef.current = null; // stroke finished — clear buffer
+    batchRef.current = null;
     fetch("/api/draw", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -171,16 +186,10 @@ export default function RoomPage() {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    // Update refs only — the interval sends cursor position, no direct trigger here
+    localCursorRef.current = { x, y };
     setLocalCursor({ x, y, visible: true });
-
-    if (channelRef.current && selfIdRef.current) {
-      channelRef.current.trigger("client-cursor-move", {
-        id: selfIdRef.current, x, y,
-        name: userName,
-        hue: selfHue,
-      });
-    }
-  }, [userName, selfHue]);
+  }, []);
 
   function copyRoomCode() {
     navigator.clipboard.writeText(roomId).then(() => {
